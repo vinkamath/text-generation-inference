@@ -19,7 +19,7 @@ import torch.distributed
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple, Any, Dict
 from text_generation_server.utils.import_utils import SYSTEM
 
 if SYSTEM != "ipex":
@@ -57,8 +57,8 @@ class DeepseekV2Config(PretrainedConfig):
         num_hidden_layers=30,
         num_attention_heads=32,
         num_key_value_heads=32,
-        n_shared_experts=None,
-        n_routed_experts=None,
+        n_shared_experts=2,
+        n_routed_experts=160,
         ep_size=1,
         routed_scaling_factor=1.0,
         kv_lora_rank=512,
@@ -67,9 +67,9 @@ class DeepseekV2Config(PretrainedConfig):
         v_head_dim=128,
         qk_nope_head_dim=128,
         topk_method="gready",
-        n_group=None,
-        topk_group=None,
-        num_experts_per_tok=None,
+        n_group=8,
+        topk_group=3,
+        num_experts_per_tok=6,
         moe_layer_freq=1,
         first_k_dense_replace=0,
         norm_topk_prob=False,
@@ -168,16 +168,23 @@ def load_attention(config, prefix, weights):
     )
 
 
-def _load_experts(config, prefix, weights):
+def _load_experts(config, prefix, mat, weights):
+    if config.quantize is not None:
+        raise NotImplementedError(
+            "Deepseek V2 does not support weight quantization yet."
+        )
+
+    assert mat in ["gate_proj", "up_proj", "gate_down"]
+
     world_size = weights.process_group.size()
     rank = weights.process_group.rank()
 
-    assert (
-        config.hidden_size % world_size == 0
-    ), f"The chosen expert intermediate_size size {config.moe_intermediate_size} is not compatible with sharding on {world_size} shards"
+    # TODO: fixup and enable
+    # assert (
+    #    config.intermediate_size % world_size == 0
+    # ), f"The chosen size {config.intermediate_size} is not compatible with sharding on {world_size} shards"
 
-    expert_size = config.moe_intermediate_size
-    block_size = expert_size // world_size
+    block_size = config.moe_intermediate_size // world_size
     start = rank * block_size
     stop = (rank + 1) * block_size
 
@@ -187,12 +194,13 @@ def _load_experts(config, prefix, weights):
         device=weights.device,
     )
 
-    slice_ = weights._get_slice(f"{prefix}")
+    for i in range(config.n_routed_experts):
+        slice_ = weights._get_slice(f"{prefix}.{i}.{mat}.weight")
 
-    for i in range(config.n_routing_experts):
-        offset = i * expert_size
-        expert_slice = slice_[start + offset : stop + offset]
-
+        if mat == "gate_up_proj":
+            expert_slice = slice_[:, start:stop].t().contiguous()
+        else:
+            expert_slice = slice_[start:stop]
         tensor[i * block_size : (i + 1) * block_size] = expert_slice.to(
             dtype=weights.dtype
         ).to(device=weights.device)
@@ -408,7 +416,13 @@ class DeepseekV2Attention(torch.nn.Module):
                 max_s,
             )
 
-        return self.o_proj(attn_output.view(-1, self.num_heads * self.head_size))
+        # Remove padding.
+        logger.warning(f"attention output: {attn_output.shape}")
+        attn_output = attn_output[..., : self.v_head_dim]
+        logger.warning(f"attention output after unpad: {attn_output.shape}")
+        logger.warning(f"v_head_dim: {self.v_head_dim}")
+
+        return self.o_proj(attn_output.reshape(-1, self.num_heads * self.v_head_dim))
 
 
 class DeepseekV2MLP(nn.Module):
@@ -450,7 +464,7 @@ class DeepseekV2MLP(nn.Module):
         # TODO: This is a hotfix to be removed & properly refactored.
         self.quantize = config.quantize
 
-    def forward(self, hidden_states, adapter_data):
+    def forward(self, hidden_states):
         if (
             SYSTEM == "rocm"
             and self.hidden_act == "silu"
@@ -464,13 +478,11 @@ class DeepseekV2MLP(nn.Module):
                 device="cuda",
             )
             _custom_C.LLMM_Silu(self.gate_up_proj.linear.weight, hidden_states, out, 8)
-            return self.down_proj(out, adapter_data)
+            return self.down_proj(out)
         else:
-            gate_up_states = self.gate_up_proj(hidden_states, adapter_data)
+            gate_up_states = self.gate_up_proj(hidden_states)
             gate_up_states = gate_up_states.view(-1, 2, self.intermediate_size)
-            return self.down_proj(
-                self.act(gate_up_states[:, 0]) * gate_up_states[:, 1], adapter_data
-            )
+            return self.down_proj(self.act(gate_up_states[:, 0]) * gate_up_states[:, 1])
 
 
 @torch.jit.script
@@ -502,17 +514,34 @@ class BlockSparseMoE(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size // weights.process_group.size()
         self.n_experts = config.n_routed_experts
+        self.n_group = config.n_group
+        self.top_k_group = config.topk_group
         self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
 
-        self.experts = nn.ModuleList(
-            [
-                DeepseekV2MLP(
-                    prefix=f"{prefix}.experts.{idx}", config=config, weights=weights
-                )
-                for idx in range(self.n_experts)
-            ]
+        # self.experts = nn.ModuleList(
+        #    [
+        #        DeepseekV2MLP(
+        #            prefix=f"{prefix}.experts.{idx}", config=config, weights=weights
+        #        )
+        #        for idx in range(self.n_experts)
+        #    ]
+        # )
+
+        gate_proj = _load_experts(
+            config, f"{prefix}.experts", "gate_proj", weights
+        ).view(self.n_experts, self.ffn_dim, self.hidden_dim)
+
+        up_proj = _load_experts(config, f"{prefix}.experts", "up_proj", weights).view(
+            self.n_experts, self.ffn_dim, self.hidden_dim
         )
+
+        self.gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
+
+        self.down_proj = _load_experts(
+            config, f"{prefix}.experts", "down_proj", weights
+        ).view(self.n_experts, self.hiden_dim, self.ffn_dim)
 
         # gating
         self.gate = FastLinear.load(config, f"{prefix}.gate", weights, bias=False)
@@ -527,14 +556,16 @@ class BlockSparseMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(x)
-        out = fused_moe(
-            x,
-            self.wv1,
-            self.w2,
+        topk_weights, topk_ids = grouped_topk(
             router_logits,
             self.top_k,
-            renormalize=self.moe_normalize_expert_weights,
-            inplace=True,
+            renormalize=self.norm_topk_prob,
+            num_expert_group=self.n_group,
+            topk_group=self.topk_group,
+        )
+
+        out = fused_experts(
+            x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, inplace=True
         )
 
         # Reduce sum
@@ -817,3 +848,155 @@ class FlashDeepseekV2ForCausalLM(torch.nn.Module):
             hidden_states = hidden_states[lm_head_indices]
         logits, speculative_logits = self.lm_head(hidden_states)
         return logits, speculative_logits
+
+
+# From vLLM below. Update vLLM to use these rather than vendoring.
+
+
+def grouped_topk(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int = 0,
+    topk_group: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    scores = torch.softmax(gating_output, dim=-1)
+    num_token = scores.shape[0]
+    group_scores = (
+        scores.view(num_token, num_expert_group, -1).max(dim=-1).values
+    )  # [n, n_group]
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+        1
+    ]  # [n, top_k_group]
+    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+        .reshape(num_token, -1)
+    )  # [n, e]
+    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    topk_weights, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids
+
+
+def fused_experts(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    inplace: bool = False,
+    override_config: Optional[Dict[str, Any]] = None,
+    use_fp8: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+):
+    # Check constraints.
+    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+    assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    import triton.language as tl
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.fused_moe import (
+        get_moe_configs,
+        invoke_fused_moe_kernel,
+        moe_align_block_size,
+        get_default_config,
+    )
+
+    M, _ = hidden_states.shape
+    E, N, _ = w1.shape
+
+    if override_config:
+        config = override_config
+    else:
+        # First try to load optimal config from the file
+        configs = get_moe_configs(E, w2.shape[2], "float8" if use_fp8 else None)
+
+        if configs:
+            # If an optimal configuration map has been found, look up the
+            # optimal config
+            config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        else:
+            # Else use the default config
+            config = get_default_config(
+                M, E, N, w1.shape[2], topk_ids.shape[1], "float8" if use_fp8 else None
+            )
+
+    intermediate_cache1 = torch.empty(
+        (M, topk_ids.shape[1], N),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache2 = torch.empty(
+        (M * topk_ids.shape[1], N // 2),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    intermediate_cache3 = torch.empty(
+        (M, topk_ids.shape[1], w2.shape[1]),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, config["BLOCK_SIZE_M"], E
+    )
+    compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+
+    invoke_fused_moe_kernel(
+        hidden_states,
+        w1,
+        intermediate_cache1,
+        a1_scale,
+        w1_scale,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        False,
+        topk_ids.shape[1],
+        config,
+        compute_type=compute_type,
+        use_fp8=use_fp8,
+    )
+
+    ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+
+    invoke_fused_moe_kernel(
+        intermediate_cache2,
+        w2,
+        intermediate_cache3,
+        a2_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        True,
+        1,
+        config,
+        compute_type=compute_type,
+        use_fp8=use_fp8,
+    )
+
+    if inplace:
+        return torch.sum(
+            intermediate_cache3.view(*intermediate_cache3.shape),
+            dim=1,
+            out=hidden_states,
+        )
+    return torch.sum(intermediate_cache3.view(*intermediate_cache3.shape), dim=1)
