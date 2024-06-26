@@ -53,6 +53,7 @@ FLASH_ATT_ERROR_MESSAGE = "{} requires Flash Attention enabled models."
 FLASH_ATTENTION = True
 
 try:
+    from text_generation_server.models.flash_deepseek_v2 import FlashDeepseekV2
     from text_generation_server.models.flash_rw import FlashRWSharded
     from text_generation_server.models.flash_gpt2 import FlashGPT2
     from text_generation_server.models.flash_neox import FlashNeoXSharded
@@ -92,6 +93,7 @@ except ImportError as e:
     FLASH_ATTENTION = False
 
 if FLASH_ATTENTION:
+    __all__.append(FlashDeepseekV2)
     __all__.append(FlashGPT2)
     __all__.append(FlashNeoXSharded)
     __all__.append(FlashRWSharded)
@@ -120,6 +122,11 @@ if MAMBA_AVAILABLE:
 
 
 class ModelType(enum.Enum):
+    DEEPSEEK_V2 = {
+        "type": "deepseek_v2",
+        "name": "Deepseek V2",
+        "url": "https://huggingface.co/deepseek-ai/DeepSeek-V2",
+    }
     IDEFICS2 = {
         "type": "idefics2",
         "name": "Idefics 2",
@@ -433,7 +440,31 @@ def get_model(
             f"The backend {SYSTEM} does not support sliding window attention that is used by the model type {model_type}. To use this model nonetheless with the {SYSTEM} backend, please launch TGI with the argument `--max-input-tokens` smaller than sliding_window={sliding_window} (got here max_input_tokens={max_input_tokens})."
         )
 
-    if model_type == MAMBA:
+    if model_type == DEEPSEEK_V2:
+        if FLASH_ATTENTION:
+            return FlashDeepseekV2(
+                model_id,
+                revision,
+                quantize=quantize,
+                speculator=speculator,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+            )
+        elif sharded:
+            raise NotImplementedError(
+                FLASH_ATT_ERROR_MESSAGE.format("Sharded Deepseek V2")
+            )
+        else:
+            return CausalLM(
+                model_id,
+                revision,
+                quantize=quantize,
+                speculator=speculator,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+            )
+
+    elif model_type == MAMBA:
         return Mamba(
             model_id,
             revision,
