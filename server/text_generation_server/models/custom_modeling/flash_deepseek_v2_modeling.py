@@ -174,7 +174,7 @@ def _load_experts(config, prefix, mat, weights):
             "Deepseek V2 does not support weight quantization yet."
         )
 
-    assert mat in ["gate_proj", "up_proj", "gate_down"]
+    assert mat in ["gate_proj", "up_proj", "down_proj"]
 
     world_size = weights.process_group.size()
     rank = weights.process_group.rank()
@@ -197,7 +197,7 @@ def _load_experts(config, prefix, mat, weights):
     for i in range(config.n_routed_experts):
         slice_ = weights._get_slice(f"{prefix}.{i}.{mat}.weight")
 
-        if mat == "gate_up_proj":
+        if mat == "down_proj":
             expert_slice = slice_[:, start:stop].t().contiguous()
         else:
             expert_slice = slice_[start:stop]
@@ -513,9 +513,12 @@ class BlockSparseMoE(nn.Module):
         super().__init__()
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size // weights.process_group.size()
+        self.moe_intermediate_size = (
+            config.moe_intermediate_size // weights.process_group.size()
+        )
         self.n_experts = config.n_routed_experts
         self.n_group = config.n_group
-        self.top_k_group = config.topk_group
+        self.topk_group = config.topk_group
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -529,21 +532,22 @@ class BlockSparseMoE(nn.Module):
         #    ]
         # )
 
+        # Single gate_proj: [1 408, 2 048]
         gate_proj = _load_experts(
             config, f"{prefix}.experts", "gate_proj", weights
-        ).view(self.n_experts, self.ffn_dim, self.hidden_dim)
+        ).view(self.n_experts, self.moe_intermediate_size, self.hidden_dim)
 
         up_proj = _load_experts(config, f"{prefix}.experts", "up_proj", weights).view(
-            self.n_experts, self.ffn_dim, self.hidden_dim
+            self.n_experts, self.moe_intermediate_size, self.hidden_dim
         )
 
         self.gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
 
         self.down_proj = _load_experts(
             config, f"{prefix}.experts", "down_proj", weights
-        ).view(self.n_experts, self.hiden_dim, self.ffn_dim)
+        ).view(self.n_experts, self.hidden_dim, self.moe_intermediate_size)
 
-        # gating
+        # Gating
         self.gate = FastLinear.load(config, f"{prefix}.gate", weights, bias=False)
 
         if config.n_shared_experts is not None:
@@ -884,6 +888,30 @@ def grouped_topk(
     return topk_weights, topk_ids
 
 
+def get_default_config(
+    M: int,
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: Optional[str],
+) -> Dict[str, int]:
+    config = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+    }
+    if M <= E:
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
+    return config
+
+
 def fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -908,11 +936,10 @@ def fused_experts(
 
     import triton.language as tl
     from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.fused_moe import (
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
         get_moe_configs,
         invoke_fused_moe_kernel,
         moe_align_block_size,
-        get_default_config,
     )
 
     M, _ = hidden_states.shape
