@@ -404,11 +404,14 @@ class DeepseekV2Attention(torch.nn.Module):
             )
         # Decode
         else:
+            logger.warning(
+                f"paged attention -> query: {query.shape}, key: {key.shape}, value: {value_states.shape}"
+            )
             paged_attention(
                 attn_output,
                 query,
-                key,
-                value_states,
+                kv_cache[0],
+                kv_cache[1],
                 self.kv_head_mapping,
                 self.softmax_scale,
                 block_tables,
@@ -420,7 +423,6 @@ class DeepseekV2Attention(torch.nn.Module):
         logger.warning(f"attention output: {attn_output.shape}")
         attn_output = attn_output[..., : self.v_head_dim]
         logger.warning(f"attention output after unpad: {attn_output.shape}")
-        logger.warning(f"v_head_dim: {self.v_head_dim}")
 
         return self.o_proj(attn_output.reshape(-1, self.num_heads * self.v_head_dim))
 
