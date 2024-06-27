@@ -339,7 +339,7 @@ class DeepseekV2Attention(torch.nn.Module):
         query = query.view(-1, self.num_heads, self.q_head_size)
         from loguru import logger
 
-        query_nope, query_pe = torch.split(
+        _, query_pe = torch.split(
             query, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
@@ -354,7 +354,7 @@ class DeepseekV2Attention(torch.nn.Module):
             )
             # .transpose(1, 2)
         )
-        k_nope, value_states = torch.split(
+        k_nope, value = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
 
@@ -365,29 +365,25 @@ class DeepseekV2Attention(torch.nn.Module):
         key[..., : self.qk_nope_head_dim] = k_nope
         key[..., self.qk_nope_head_dim :] = k_pe
 
-        logger.warning(
-            f"query: {query.shape}, key: {key.shape}, value: {value_states.shape}"
-        )
-
-        reshape_and_cache(key, value_states, kv_cache[0], kv_cache[1], slots)
-
-        logger.warning(
-            f"after reshape_and_cache -> query: {query.shape}, key: {key.shape}, value: {value_states.shape}"
-        )
+        logger.warning(f"query: {query.shape}, key: {key.shape}, value: {value.shape}")
 
         # We need to pad the heads because Flash Attention does not support
         # qk and v with different head sizes.
         query = torch.nn.functional.pad(query, (0, 256 - self.q_head_size), value=0)
         key = torch.nn.functional.pad(key, (0, 256 - self.q_head_size), value=0)
-        value_states = torch.nn.functional.pad(
-            value_states, (0, 256 - self.v_head_dim), value=0
-        )
+        value = torch.nn.functional.pad(value, (0, 256 - self.v_head_dim), value=0)
 
         logger.warning(
-            f"after pad -> query: {query.shape}, key: {key.shape}, value: {value_states.shape}"
+            f"after pad -> query: {query.shape}, key: {key.shape}, value: {value.shape}"
         )
 
-        # output tensor
+        reshape_and_cache(key, value, kv_cache[0], kv_cache[1], slots)
+
+        logger.warning(
+            f"after reshape_and_cache -> query: {query.shape}, key: {key.shape}, value: {value.shape}"
+        )
+
+        # Output tensor
         attn_output = torch.empty_like(query)
 
         # Prefill
@@ -396,7 +392,7 @@ class DeepseekV2Attention(torch.nn.Module):
             attention(
                 query,
                 key,
-                value_states,
+                value,
                 attn_output,
                 cu_seqlen_prefill,
                 max_s,
@@ -405,7 +401,7 @@ class DeepseekV2Attention(torch.nn.Module):
         # Decode
         else:
             logger.warning(
-                f"paged attention -> query: {query.shape}, key: {key.shape}, value: {value_states.shape}"
+                f"paged attention -> query: {query.shape}, key: {key.shape}, value: {value.shape}"
             )
             paged_attention(
                 attn_output,

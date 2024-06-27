@@ -69,7 +69,8 @@ class FlashDeepseekV2(FlashCausalLM):
             tokenizer=tokenizer,
             num_layers=len(model.model.layers),
             num_kv_heads=model.model.num_key_value_heads,
-            head_size=model.model.head_size,
+            # As far as the cache is concerned, the head size is always 256 due to padding.
+            head_size=256,
             dtype=dtype,
             device=device,
             rank=rank,
