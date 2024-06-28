@@ -239,13 +239,12 @@ class DeepseekV2Attention(torch.nn.Module):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
-        self.head_size = self.hidden_size // self.num_heads
         self.kv_lora_rank = config.kv_lora_rank
         self.q_lora_rank = config.q_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_size = config.qk_nope_head_dim + config.qk_rope_head_dim
-        self.v_head_dim = config.v_head_dim
+        self.head_size = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.value_head_size = config.v_head_dim
 
         self.rotary_emb = PositionRotaryEmbedding.static(
             config=config,
@@ -254,7 +253,7 @@ class DeepseekV2Attention(torch.nn.Module):
             device=weights.device,
         )
 
-        self.softmax_scale = self.qk_head_size**-0.5
+        self.softmax_scale = self.head_size**-0.5
 
         if self.num_heads % weights.process_group.size() != 0:
             raise ValueError(
@@ -319,7 +318,7 @@ class DeepseekV2Attention(torch.nn.Module):
         else:
             # TODO: add linears to constructor.
             query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states))[0])
-        query = query.view(-1, self.num_heads, self.qk_head_size)
+        query = query.view(-1, self.num_heads, self.head_size)
 
         _, query_pe = torch.split(
             query, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -331,10 +330,10 @@ class DeepseekV2Attention(torch.nn.Module):
         )
         key_pe = key_pe.view(-1, 1, self.qk_rope_head_dim)
         kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv.contiguous())[0]).view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            -1, self.num_key_value_heads, self.qk_nope_head_dim + self.value_head_size
         )
         key_nope, value = torch.split(
-            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            kv, [self.qk_nope_head_dim, self.value_head_size], dim=-1
         )
 
         self.rotary_emb(query_pe, key_pe, cos, sin)
@@ -349,9 +348,9 @@ class DeepseekV2Attention(torch.nn.Module):
         #
         # TODO: update to use the smallest possible supported size (e.g. 192
         # for stock deepseek v2).
-        query = torch.nn.functional.pad(query, (0, 256 - self.qk_head_size), value=0)
-        key = torch.nn.functional.pad(key, (0, 256 - self.qk_head_size), value=0)
-        value = torch.nn.functional.pad(value, (0, 256 - self.v_head_dim), value=0)
+        query = torch.nn.functional.pad(query, (0, 256 - self.head_size), value=0)
+        key = torch.nn.functional.pad(key, (0, 256 - self.head_size), value=0)
+        value = torch.nn.functional.pad(value, (0, 256 - self.value_head_size), value=0)
 
         reshape_and_cache(key, value, kv_cache[0], kv_cache[1], slots)
 
@@ -385,27 +384,23 @@ class DeepseekV2Attention(torch.nn.Module):
             )
 
         # Remove padding.
-        attn_output = attn_output[..., : self.v_head_dim]
+        attn_output = attn_output[..., : self.value_head_size]
 
-        return self.o_proj(attn_output.reshape(-1, self.num_heads * self.v_head_dim))
+        return self.o_proj(
+            attn_output.reshape(-1, self.num_heads * self.value_head_size)
+        )
 
 
 class DeepseekV2MLP(nn.Module):
     def __init__(self, prefix: str, config, weights, intermediate_size: int):
         super().__init__()
         self.hidden_act = config.hidden_act
-        self.act = (
-            ACT2FN[self.hidden_act]
-            if "gelu" not in self.hidden_act
-            else lambda x: torch.nn.functional.gelu(
-                x,
-                approximate=(
-                    "tanh"
-                    if self.hidden_act in ["gelu_fast", "gelu_pytorch_tanh"]
-                    else "none"
-                ),
+        if self.hidden_act != "silu":
+            # Bail out because MoE only supports silu.
+            raise NotImplementedError(
+                "Currently only `silu` is supported as an activation for Deepseek V2."
             )
-        )
+        self.act = ACT2FN[self.hidden_act]
 
         self.gate_up_proj = TensorParallelColumnLinear.load_multi(
             config,
@@ -456,8 +451,8 @@ class BlockSparseMoE(nn.Module):
         self.moe_intermediate_size = (
             config.moe_intermediate_size // weights.process_group.size()
         )
-        self.n_experts = config.n_routed_experts
-        self.n_group = config.n_group
+        self.n_routed_experts = config.n_routed_experts
+        self.n_expert_group = config.n_group
         self.topk_group = config.topk_group
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
@@ -465,17 +460,17 @@ class BlockSparseMoE(nn.Module):
 
         gate_proj = _load_experts(
             config, f"{prefix}.experts", "gate_proj", weights
-        ).view(self.n_experts, self.moe_intermediate_size, self.hidden_dim)
+        ).view(self.n_routed_experts, self.moe_intermediate_size, self.hidden_dim)
 
         up_proj = _load_experts(config, f"{prefix}.experts", "up_proj", weights).view(
-            self.n_experts, self.moe_intermediate_size, self.hidden_dim
+            self.n_routed_experts, self.moe_intermediate_size, self.hidden_dim
         )
 
         self.gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
 
         self.down_proj = _load_experts(
             config, f"{prefix}.experts", "down_proj", weights
-        ).view(self.n_experts, self.hidden_dim, self.moe_intermediate_size)
+        ).view(self.n_routed_experts, self.hidden_dim, self.moe_intermediate_size)
 
         # Gating
         self.gate = FastLinear.load(config, f"{prefix}.gate", weights, bias=False)
@@ -500,10 +495,9 @@ class BlockSparseMoE(nn.Module):
             router_logits,
             self.top_k,
             renormalize=self.norm_topk_prob,
-            num_expert_group=self.n_group,
+            num_expert_group=self.n_expert_group,
             topk_group=self.topk_group,
         )
-
         out = (
             fused_experts(
                 x,
