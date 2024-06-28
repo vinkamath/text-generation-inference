@@ -43,8 +43,6 @@ class FlashDeepseekV2(FlashCausalLM):
             padding_side="left",
             truncation_side="left",
             trust_remote_code=trust_remote_code,
-            use_fast=True,
-            from_slow=False,
         )
 
         config = DeepseekV2Config.from_pretrained(
