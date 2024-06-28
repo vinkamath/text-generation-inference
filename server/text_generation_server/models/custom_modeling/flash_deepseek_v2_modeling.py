@@ -337,7 +337,6 @@ class DeepseekV2Attention(torch.nn.Module):
         else:
             query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states))[0])
         query = query.view(-1, self.num_heads, self.q_head_size)
-        from loguru import logger
 
         _, query_pe = torch.split(
             query, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -365,23 +364,13 @@ class DeepseekV2Attention(torch.nn.Module):
         key[..., : self.qk_nope_head_dim] = k_nope
         key[..., self.qk_nope_head_dim :] = k_pe
 
-        logger.warning(f"query: {query.shape}, key: {key.shape}, value: {value.shape}")
-
         # We need to pad the heads because Flash Attention does not support
         # qk and v with different head sizes.
         query = torch.nn.functional.pad(query, (0, 256 - self.q_head_size), value=0)
         key = torch.nn.functional.pad(key, (0, 256 - self.q_head_size), value=0)
         value = torch.nn.functional.pad(value, (0, 256 - self.v_head_dim), value=0)
 
-        logger.warning(
-            f"after pad -> query: {query.shape}, key: {key.shape}, value: {value.shape}"
-        )
-
         reshape_and_cache(key, value, kv_cache[0], kv_cache[1], slots)
-
-        logger.warning(
-            f"after reshape_and_cache -> query: {query.shape}, key: {key.shape}, value: {value.shape}"
-        )
 
         # Output tensor
         attn_output = torch.empty_like(query)
@@ -400,9 +389,6 @@ class DeepseekV2Attention(torch.nn.Module):
             )
         # Decode
         else:
-            logger.warning(
-                f"paged attention -> query: {query.shape}, key: {key.shape}, value: {value.shape}"
-            )
             paged_attention(
                 attn_output,
                 query,
@@ -416,15 +402,13 @@ class DeepseekV2Attention(torch.nn.Module):
             )
 
         # Remove padding.
-        logger.warning(f"attention output: {attn_output.shape}")
         attn_output = attn_output[..., : self.v_head_dim]
-        logger.warning(f"attention output after unpad: {attn_output.shape}")
 
         return self.o_proj(attn_output.reshape(-1, self.num_heads * self.v_head_dim))
 
 
 class DeepseekV2MLP(nn.Module):
-    def __init__(self, prefix: str, config, weights):
+    def __init__(self, prefix: str, config, weights, intermediate_size: int):
         super().__init__()
         self.hidden_act = config.hidden_act
         self.act = (
@@ -455,9 +439,7 @@ class DeepseekV2MLP(nn.Module):
             bias=False,
         )
 
-        self.intermediate_size = (
-            config.intermediate_size // weights.process_group.size()
-        )
+        self.intermediate_size = intermediate_size // weights.process_group.size()
 
         # TODO: This is a hotfix to be removed & properly refactored.
         self.quantize = config.quantize
@@ -521,16 +503,6 @@ class BlockSparseMoE(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
 
-        # self.experts = nn.ModuleList(
-        #    [
-        #        DeepseekV2MLP(
-        #            prefix=f"{prefix}.experts.{idx}", config=config, weights=weights
-        #        )
-        #        for idx in range(self.n_experts)
-        #    ]
-        # )
-
-        # Single gate_proj: [1 408, 2 048]
         gate_proj = _load_experts(
             config, f"{prefix}.experts", "gate_proj", weights
         ).view(self.n_experts, self.moe_intermediate_size, self.hidden_dim)
@@ -550,13 +522,18 @@ class BlockSparseMoE(nn.Module):
 
         if config.n_shared_experts is not None:
             self.shared_experts = DeepseekV2MLP(
-                prefix=f"{prefix}.shared_experts", config=config, weights=weights
+                prefix=f"{prefix}.shared_experts",
+                config=config,
+                weights=weights,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
             )
+        else:
+            self.shared_experts = None
 
         self.process_group = weights.process_group
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(x)
         topk_weights, topk_ids = grouped_topk(
             router_logits,
@@ -569,6 +546,9 @@ class BlockSparseMoE(nn.Module):
         out = fused_experts(
             x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, inplace=True
         )
+
+        if self.shared_experts is not None:
+            out += self.shared_experts(x)
 
         # Reduce sum
         if self.process_group.size() > 1:
@@ -695,7 +675,10 @@ class DeepseekV2Layer(nn.Module):
             self.mlp = moe_cls(f"{prefix}.mlp", config, weights)
         else:
             self.mlp = DeepseekV2MLP(
-                prefix=f"{prefix}.mlp", config=config, weights=weights
+                prefix=f"{prefix}.mlp",
+                config=config,
+                weights=weights,
+                intermediate_size=config.intermediate_size,
             )
 
         self.input_layernorm = FastRMSNorm.load(
