@@ -22,9 +22,6 @@ from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple, Any, Dict
 from text_generation_server.utils.import_utils import SYSTEM
 
-if SYSTEM != "ipex":
-    from vllm.model_executor.layers.fused_moe import fused_moe
-
 from text_generation_server.layers.attention import (
     paged_attention,
     attention,
@@ -153,21 +150,6 @@ class DeepseekV2Config(PretrainedConfig):
         )
 
 
-def promote_scalar(x: torch.Tensor) -> torch.Tensor:
-    return x.view(1) if len(x.size()) == 0 else x
-
-
-def load_attention(config, prefix, weights):
-    return TensorParallelColumnLinear.load_qkv(
-        config,
-        prefix=f"{prefix}.Wqkv",
-        weights=weights,
-        bias=False,
-        num_heads=config.num_attention_heads,
-        num_key_value_heads=config.num_key_value_heads,
-    )
-
-
 def _load_experts(config, prefix, mat, weights):
     if config.quantize is not None:
         raise NotImplementedError(
@@ -262,7 +244,7 @@ class DeepseekV2Attention(torch.nn.Module):
         self.q_lora_rank = config.q_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.q_head_size = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.qk_head_size = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
 
         self.rotary_emb = PositionRotaryEmbedding.static(
@@ -272,7 +254,7 @@ class DeepseekV2Attention(torch.nn.Module):
             device=weights.device,
         )
 
-        self.softmax_scale = self.head_size**-0.5
+        self.softmax_scale = self.qk_head_size**-0.5
 
         if self.num_heads % weights.process_group.size() != 0:
             raise ValueError(
@@ -335,39 +317,40 @@ class DeepseekV2Attention(torch.nn.Module):
         if self.q_lora_rank is None:
             query = self.query(hidden_states)
         else:
+            # TODO: add linears to constructor.
             query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states))[0])
-        query = query.view(-1, self.num_heads, self.q_head_size)
+        query = query.view(-1, self.num_heads, self.qk_head_size)
 
         _, query_pe = torch.split(
             query, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
-        compressed_kv, k_pe = torch.split(
+        compressed_kv, key_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        kv = (
-            self.kv_b_proj(self.kv_a_layernorm(compressed_kv.contiguous())[0]).view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            # .transpose(1, 2)
+        key_pe = key_pe.view(-1, 1, self.qk_rope_head_dim)
+        kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv.contiguous())[0]).view(
+            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
-        k_nope, value = torch.split(
+        key_nope, value = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
 
-        self.rotary_emb(query_pe, k_pe, cos, sin)
+        self.rotary_emb(query_pe, key_pe, cos, sin)
 
         query[..., self.qk_nope_head_dim :] = query_pe
         key = torch.empty_like(query)
-        key[..., : self.qk_nope_head_dim] = k_nope
-        key[..., self.qk_nope_head_dim :] = k_pe
+        key[..., : self.qk_nope_head_dim] = key_nope
+        key[..., self.qk_nope_head_dim :] = key_pe
 
         # We need to pad the heads because Flash Attention does not support
         # qk and v with different head sizes.
-        query = torch.nn.functional.pad(query, (0, 256 - self.q_head_size), value=0)
-        key = torch.nn.functional.pad(key, (0, 256 - self.q_head_size), value=0)
+        #
+        # TODO: update to use the smallest possible supported size (e.g. 192
+        # for stock deepseek v2).
+        query = torch.nn.functional.pad(query, (0, 256 - self.qk_head_size), value=0)
+        key = torch.nn.functional.pad(key, (0, 256 - self.qk_head_size), value=0)
         value = torch.nn.functional.pad(value, (0, 256 - self.v_head_dim), value=0)
 
         reshape_and_cache(key, value, kv_cache[0], kv_cache[1], slots)
@@ -465,29 +448,6 @@ class DeepseekV2MLP(nn.Module):
             return self.down_proj(self.act(gate_up_states[:, 0]) * gate_up_states[:, 1])
 
 
-@torch.jit.script
-def select_experts(
-    gate_logits: torch.Tensor, top_k: int, moe_normalize_expert_weights: int
-):
-    # all_probs: (sequence_length, n_experts) and upcast for softmax
-    all_probs = torch.nn.functional.softmax(gate_logits, dim=1, dtype=torch.float)
-    # weights, selected_experts: (sequence_length, top-k)
-    weights, selected_experts = torch.topk(all_probs, top_k, dim=-1)
-    if moe_normalize_expert_weights:
-        weights = weights / torch.norm(
-            weights, p=moe_normalize_expert_weights, dim=-1, keepdim=True
-        )
-    weights = weights.view(-1)
-    selected_experts = selected_experts.view(-1)
-
-    return selected_experts, weights
-
-
-@torch.jit.script
-def round_up(x: torch.Tensor, value: int):
-    return torch.div(x + (value - 1), value, rounding_mode="trunc") * value
-
-
 class BlockSparseMoE(nn.Module):
     def __init__(self, prefix, config: DeepseekV2Config, weights):
         super().__init__()
@@ -536,6 +496,7 @@ class BlockSparseMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(x)
         topk_weights, topk_ids = grouped_topk(
+            x,
             router_logits,
             self.top_k,
             renormalize=self.norm_topk_prob,
@@ -543,8 +504,16 @@ class BlockSparseMoE(nn.Module):
             topk_group=self.topk_group,
         )
 
-        out = fused_experts(
-            x, self.gate_up_proj, self.down_proj, topk_weights, topk_ids, inplace=True
+        out = (
+            fused_experts(
+                x,
+                self.gate_up_proj,
+                self.down_proj,
+                topk_weights,
+                topk_ids,
+                inplace=True,
+            )
+            * self.routed_scaling_factor
         )
 
         if self.shared_experts is not None:
@@ -839,6 +808,7 @@ class FlashDeepseekV2ForCausalLM(torch.nn.Module):
 
 
 def grouped_topk(
+    hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
