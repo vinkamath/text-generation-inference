@@ -1,6 +1,7 @@
 import os
 import torch
 from torch import nn
+from loguru import logger
 
 from text_generation_server.utils.import_utils import SYSTEM
 
@@ -209,6 +210,7 @@ class PositionRotaryEmbedding(nn.Module):
         return cls(inv_freq, scaling_factor)
 
     def _update_cos_sin_cache(self, dtype, device, seqlen):
+        logger.info("wrong cache!")
         # Reset the tables if the sequence length has changed,
         # or if we're on a new device (possibly due to tracing for instance)
         if (
@@ -237,6 +239,7 @@ class PositionRotaryEmbedding(nn.Module):
             # But later on goes and cast cos/sin to float anyway: https://github.com/Dao-AILab/flash-attention/blob/017716451d446e464dde9aca3a3c1ed2209caaa9/csrc/rotary/rotary_cuda.cu#L29, which looks suboptimal.
             dtype = torch.float32
 
+        logger.info("get_cos_sin")
         self._update_cos_sin_cache(dtype, position_ids.device, max_s)
 
         cos = torch.index_select(self._cos_cached, 0, position_ids)
@@ -385,6 +388,8 @@ class YarnPositionRotaryEmbedding(PositionRotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        self.mscale_all_dim = mscale_all_dim
+        self.scaling_factor = scaling_factor
         self.mscale = float(
             get_mscale(self.scaling_factor, mscale)
             / get_mscale(self.scaling_factor, mscale_all_dim)
@@ -392,6 +397,7 @@ class YarnPositionRotaryEmbedding(PositionRotaryEmbedding):
         )  # Get n-d magnitude scaling corrected for interpolation
 
     def _update_cos_sin_cache(self, dtype, device, seqlen):
+        logger.info("update cache")
         # Reset the tables if the sequence length has changed,
         # or if we're on a new device (possibly due to tracing for instance)
         if (
@@ -399,7 +405,7 @@ class YarnPositionRotaryEmbedding(PositionRotaryEmbedding):
             or self._cos_cached.device != device
             or self._cos_cached.dtype != dtype
         ):
-            if seqlen > self.max_position_embeddings:
+            if seqlen > self.max_position_embeddings or True:
                 inv_freq_extrapolation = _create_inv_freq(
                     self.dim, self.base, self.inv_freq.device
                 )
@@ -412,6 +418,7 @@ class YarnPositionRotaryEmbedding(PositionRotaryEmbedding):
                     self.base,
                     self.max_position_embeddings,
                 )
+
                 inv_freq_mask = (
                     1 - linear_ramp_mask(low, high, self.dim // 2).float().to(device)
                 ) * self.extrapolation_factor  # Get n-d rotational scaling corrected for extrapolation
@@ -426,6 +433,7 @@ class YarnPositionRotaryEmbedding(PositionRotaryEmbedding):
                 # )  # Get n-d magnitude scaling corrected for interpolation
 
             self._seq_len_cached = seqlen
+            logger.info(f"inv_freq: {self.inv_freq.sum()} {self.inv_freq}")
             t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
             # Don't do einsum, it converts fp32 to fp16
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)

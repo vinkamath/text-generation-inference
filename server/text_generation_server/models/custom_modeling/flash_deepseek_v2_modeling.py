@@ -21,6 +21,7 @@ from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple, Any, Dict
 from text_generation_server.utils.import_utils import SYSTEM
+from loguru import logger
 
 from text_generation_server.layers.attention import (
     paged_attention,
@@ -255,6 +256,13 @@ class DeepseekV2Attention(torch.nn.Module):
 
         self.softmax_scale = self.head_size**-0.5
 
+        from text_generation_server.layers.rotary import get_mscale
+
+        mscale = get_mscale(
+            self.rotary_emb.scaling_factor, self.rotary_emb.mscale_all_dim
+        )
+        self.softmax_scale = self.softmax_scale * mscale * mscale
+
         if self.num_heads % weights.process_group.size() != 0:
             raise ValueError(
                 f"`num_heads` must be divisible by `num_shards` (got `num_heads`: {self.num_heads} "
@@ -320,7 +328,7 @@ class DeepseekV2Attention(torch.nn.Module):
             query = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states))[0])
         query = query.view(-1, self.num_heads, self.head_size)
 
-        _, query_pe = torch.split(
+        query_nope, query_pe = torch.split(
             query, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
 
@@ -328,20 +336,43 @@ class DeepseekV2Attention(torch.nn.Module):
         compressed_kv, key_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
+
         key_pe = key_pe.view(-1, 1, self.qk_rope_head_dim)
         kv = self.kv_b_proj(self.kv_a_layernorm(compressed_kv.contiguous())[0]).view(
             -1, self.num_key_value_heads, self.qk_nope_head_dim + self.value_head_size
         )
+
         key_nope, value = torch.split(
             kv, [self.qk_nope_head_dim, self.value_head_size], dim=-1
         )
 
+        # logger.info(f"cos: {cos.sum()}, sin: {sin.sum()}, shape: {cos.shape}")
+
+        # logger.info(
+        #    f"Before rotary: query_pe: {query_pe.sum()}, key_pe: {key_pe.sum()}"
+        # )
+        # logger.info(f"query_pe: {query_pe.shape}")
+        batch_size, heads, head_dim = query_pe.shape
+        query_pe = (
+            query_pe.view(batch_size, heads, head_dim // 2, 2)
+            .transpose(2, 3)
+            .reshape(batch_size, heads, head_dim)
+        )
+        batch_size, heads, head_dim = key_pe.shape
+        key_pe = (
+            key_pe.view(batch_size, heads, head_dim // 2, 2)
+            .transpose(2, 3)
+            .reshape(batch_size, heads, head_dim)
+        )
         self.rotary_emb(query_pe, key_pe, cos, sin)
+        # logger.info(f"After rotary: query_pe: {query_pe.sum()}, key_pe: {key_pe.sum()}")
 
         query[..., self.qk_nope_head_dim :] = query_pe
         key = torch.empty_like(query)
         key[..., : self.qk_nope_head_dim] = key_nope
         key[..., self.qk_nope_head_dim :] = key_pe
+
+        # logger.info(f"query: {query.sum()}, key: {key.sum()}")
 
         # We need to pad the heads because Flash Attention does not support
         # qk and v with different head sizes.
@@ -353,6 +384,10 @@ class DeepseekV2Attention(torch.nn.Module):
         value = torch.nn.functional.pad(value, (0, 256 - self.value_head_size), value=0)
 
         reshape_and_cache(key, value, kv_cache[0], kv_cache[1], slots)
+
+        # logger.info(
+        #    f"after cache query: {query.sum()}, key: {key.sum()}, value: {value.sum()}"
+        # )
 
         # Output tensor
         attn_output = torch.empty_like(query)
@@ -383,8 +418,12 @@ class DeepseekV2Attention(torch.nn.Module):
                 max_s,
             )
 
+        # logger.info(f"softmax scale: {self.softmax_scale}")
+
         # Remove padding.
         attn_output = attn_output[..., : self.value_head_size]
+
+        # logger.info(f"output before oproj: {attn_output.sum()}")
 
         return self.o_proj(
             attn_output.reshape(-1, self.num_heads * self.value_head_size)
@@ -498,6 +537,7 @@ class BlockSparseMoE(nn.Module):
             num_expert_group=self.n_expert_group,
             topk_group=self.topk_group,
         )
+        # logger.info(f"topk_idx: {topk_ids}, topk_weight: {topk_weights.sum()}")
         out = (
             fused_experts(
                 x,
@@ -682,6 +722,8 @@ class DeepseekV2Layer(nn.Module):
             max_s,
         )
 
+        # logger.info(f"Attention: {attn_output.sum()}")
+
         # faster post attention rms norm
         normed_attn_res_output, attn_res = self.post_attention_layernorm(
             attn_output, res
@@ -730,6 +772,8 @@ class DeepseekV2Model(torch.nn.Module):
         max_s: int,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+
+        # logger.info(f"input_ids: {input_ids}")
 
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
