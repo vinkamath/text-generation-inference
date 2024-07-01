@@ -497,19 +497,33 @@ class BlockSparseMoE(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
 
-        gate_proj = _load_experts(
-            config, f"{prefix}.experts", "gate_proj", weights
-        ).view(self.n_routed_experts, self.moe_intermediate_size, self.hidden_dim)
-
-        up_proj = _load_experts(config, f"{prefix}.experts", "up_proj", weights).view(
-            self.n_routed_experts, self.moe_intermediate_size, self.hidden_dim
+        self.experts = nn.ModuleList(
+            [
+                DeepseekV2MLP(
+                    prefix=f"{prefix}.experts.{idx}",
+                    config=config,
+                    weights=weights,
+                    intermediate_size=config.moe_intermediate_size
+                    * config.n_shared_experts,
+                )
+                for idx in range(self.n_routed_experts)
+            ]
         )
+        self.pack_params()
 
-        self.gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
+        # gate_proj = _load_experts(
+        #    config, f"{prefix}.experts", "gate_proj", weights
+        # ).view(self.n_routed_experts, self.moe_intermediate_size, self.hidden_dim)
 
-        self.down_proj = _load_experts(
-            config, f"{prefix}.experts", "down_proj", weights
-        ).view(self.n_routed_experts, self.hidden_dim, self.moe_intermediate_size)
+        # up_proj = _load_experts(config, f"{prefix}.experts", "up_proj", weights).view(
+        #    self.n_routed_experts, self.moe_intermediate_size, self.hidden_dim
+        # )
+
+        # self.gate_up_proj = torch.cat([gate_proj, up_proj], dim=1)
+
+        # self.down_proj = _load_experts(
+        #    config, f"{prefix}.experts", "down_proj", weights
+        # ).view(self.n_routed_experts, self.hidden_dim, self.moe_intermediate_size)
 
         # Gating
         self.gate = FastLinear.load(config, f"{prefix}.gate", weights, bias=False)
@@ -527,7 +541,29 @@ class BlockSparseMoE(nn.Module):
 
         self.process_group = weights.process_group
 
+    # From VLLM, rewrite into our own loading.
+    def pack_params(self):
+        w1 = []
+        w2 = []
+        for expert in self.experts:
+            w1.append(expert.gate_up_proj.linear.weight)
+            w2.append(expert.down_proj.linear.weight)
+        self.w1 = torch._utils._flatten_dense_tensors(w1)
+        w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
+        for data, param in zip(w1s, w1):
+            param.data = data
+        self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+
+        self.w2 = torch._utils._flatten_dense_tensors(w2)
+        w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
+        for data, param in zip(w2s, w2):
+            param.data = data
+
+        self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(x)
         router_logits = self.gate(x)
         topk_weights, topk_ids = grouped_topk(
             x,
@@ -541,17 +577,22 @@ class BlockSparseMoE(nn.Module):
         out = (
             fused_experts(
                 x,
-                self.gate_up_proj,
-                self.down_proj,
+                # self.gate_up_proj,
+                self.w1,
+                # self.down_proj,
+                self.w2,
                 topk_weights,
                 topk_ids,
                 inplace=True,
             )
             * self.routed_scaling_factor
         )
+        # logger.info(f"moe output: {out.sum()}")
 
         if self.shared_experts is not None:
-            out += self.shared_experts(x)
+            out = out + shared_output
+
+        # logger.info(f"after shared experts: {out.sum()}")
 
         # Reduce sum
         if self.process_group.size() > 1:
